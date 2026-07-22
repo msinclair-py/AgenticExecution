@@ -1,0 +1,30 @@
+# Example Chroma binder-design campaign config (mirrors ChromaDesigner.from_toml).
+# Load with tomllib and pass sections into the designer.
+
+[settings]
+input_path = "targets/receptor.pdb"   # a PDB, or a directory of PDBs
+output_path = "chroma_out"
+binder_length = [40, 90]              # [min, max) — a length is sampled per round
+num_rounds = 20
+num_backbones = 10                    # backbones per round
+num_designs = 1                       # sequence designs per backbone
+diffusion_steps = 200
+store_in_memory = false               # stage outputs in /dev/shm, migrate periodically
+memory_migration_freq = 1
+
+# One or more hotspot patches; a patch is chosen at random each round.
+[hotspots.epitope1]
+type = "list"                         # "list" (explicit) or "range"
+indices = [47, 48, 49, 112, 136]      # 1-indexed target residues
+vector_scaling = 1.0                  # scales the inflate-conditioner magnitude
+
+[hotspots.epitope2]
+type = "range"
+indices = [200, 215]                  # range(200, 215)
+vector_scaling = 1.2
+
+[neural_net]
+bb_weights = "weights/chroma_backbone.pt"
+design_weights = "weights/chroma_design.pt"
+cond_weights = "weights/chroma_conditioner.pt"
+device = "auto"                       # scripts resolve xpu/cuda/cpu

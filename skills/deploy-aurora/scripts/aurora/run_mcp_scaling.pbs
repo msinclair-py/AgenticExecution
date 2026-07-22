@@ -1,0 +1,46 @@
+#!/bin/bash -l
+# High-throughput: N nodes, ALL 12 tiles per node, HTTP MCP server. Submits
+# launch_scaling_mcp.py, which attaches a HeterogeneousSettings Parsl config so
+# `execute_code` fans across nodes x 12 GPU workers.
+#
+# Set the node count with `select=` below and pick a queue that admits it:
+#   debug-scaling : 2-256   nodes, <= 1 hr
+#   prod (routing): 256+     nodes, <= 24 hr   (routes to small/medium/large)
+#   capacity      : 1-16     nodes, <= 168 hr
+# See https://docs.alcf.anl.gov/aurora/running-jobs-aurora/ for current limits.
+#
+#   qsub skills/deploy-aurora/scripts/aurora/run_mcp_scaling.pbs
+#
+#PBS -A FRAME-IDP
+#PBS -N agentic-exec-mcp-scale
+#PBS -l select=8
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=flare
+#PBS -l place=scatter
+#PBS -q debug-scaling
+#PBS -j oe
+
+set -euo pipefail
+
+# --- project + environment ---------------------------------------------------
+PROJECT_DIR=/lus/flare/projects/FRAME-IDP/msinclair/software/AgenticExecution
+cd "$PROJECT_DIR"
+
+module use /soft/modulefiles
+module load frameworks
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export TMPDIR=/tmp
+
+source "$PROJECT_DIR/.venv/bin/activate"
+
+# The launcher reproduces this environment on every remote node's HTEx manager
+# via a synthesized worker_init (it reads VIRTUAL_ENV + cwd + the vars above).
+# Run it ONCE on the head node -- Parsl owns the mpiexec fan-out over
+# $PBS_NODEFILE, so do NOT wrap this in mpiexec.
+export AGENTIC_EXECUTION_ACCEL=12          # tiles per node
+export AGENTIC_EXECUTION_THREADS=8         # OMP threads per GPU worker
+export AGENTIC_EXECUTION_OUTPUT=./execution_output
+# AGENTIC_EXECUTION_NODES / _HOST / _PORT are auto-detected; override if needed.
+
+python skills/deploy-aurora/scripts/aurora/launch_scaling_mcp.py \
+    > agentic-exec-mcp-scale.log 2>&1

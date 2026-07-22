@@ -1,0 +1,47 @@
+#!/bin/bash -l
+# High-throughput: N nodes, ALL 4 A100 GPUs per node, HTTP MCP server. Submits
+# launch_scaling_mcp.py, which attaches a HeterogeneousSettings Parsl config so
+# `execute_code` fans across nodes x 4 GPU workers.
+#
+# Set the node count with `select=` below and pick a queue that admits it:
+#   debug-scaling : 1-10   nodes, <= 1 hr
+#   prod (routing): 10-496 nodes, <= 24 hr
+#   preemptable   : 1-10   nodes, <= 72 hr
+# See https://docs.alcf.anl.gov/polaris/running-jobs/ for current limits.
+#
+#   qsub skills/deploy-polaris/scripts/polaris/run_mcp_scaling.pbs
+#
+#PBS -A FRAME-IDP
+#PBS -N agentic-exec-mcp-scale
+#PBS -l select=8:system=polaris
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:grand
+#PBS -l place=scatter
+#PBS -q debug-scaling
+#PBS -j oe
+
+set -euo pipefail
+
+# --- project + environment ---------------------------------------------------
+PROJECT_DIR=/lus/grand/projects/FRAME-IDP/msinclair/software/AgenticExecution
+cd "$PROJECT_DIR"
+
+module use /soft/modulefiles
+module load cudatoolkit-standalone/12.4.1
+export TMPDIR=/tmp
+
+source "$PROJECT_DIR/.venv/bin/activate"
+
+# The launcher reproduces this environment on every remote node's HTEx manager
+# via a synthesized worker_init (it reads VIRTUAL_ENV + AMBERHOME + cwd + the
+# CUDA module). Run it ONCE on the head node -- Parsl owns the mpiexec fan-out
+# over $PBS_NODEFILE, so do NOT wrap this in mpiexec.
+export AGENTIC_EXECUTION_ACCEL=4           # A100s per node
+export AGENTIC_EXECUTION_THREADS=8         # OMP threads per GPU worker
+export AGENTIC_EXECUTION_OUTPUT=./execution_output
+# Uncomment if snippets shell out to antechamber/tleap/parmchk2/paramfit:
+# export AMBERHOME=/path/to/amber          # its bin is APPENDED to the worker PATH
+# AGENTIC_EXECUTION_NODES / _HOST / _PORT are auto-detected; override if needed.
+
+python skills/deploy-polaris/scripts/polaris/launch_scaling_mcp.py \
+    > agentic-exec-mcp-scale.log 2>&1

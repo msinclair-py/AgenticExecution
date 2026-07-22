@@ -221,5 +221,4 @@ __marimo__/
 runinfo/
 experiments/
 uv.lock
-scripts/
 .claude

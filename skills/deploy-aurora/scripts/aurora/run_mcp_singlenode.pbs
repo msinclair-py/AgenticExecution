@@ -1,0 +1,42 @@
+#!/bin/bash -l
+# Baseline: 1 node, ONE GPU tile, HTTP MCP server. Proves the stack boots on
+# Aurora. Does NOT scale -- `python -m agentic_execution.mcp_server` builds a
+# local Parsl config that caps the 'gpu' executor at a single worker, so this
+# uses 1 of the node's 12 tiles. Use run_mcp_scaling.pbs for the real campaign.
+#
+#   qsub skills/deploy-aurora/scripts/aurora/run_mcp_singlenode.pbs
+#
+#PBS -A FRAME-IDP
+#PBS -N agentic-exec-mcp
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=flare
+#PBS -l place=scatter
+#PBS -q debug
+#PBS -j oe
+
+set -euo pipefail
+
+# --- project + environment ---------------------------------------------------
+PROJECT_DIR=/lus/flare/projects/FRAME-IDP/msinclair/software/AgenticExecution
+cd "$PROJECT_DIR"
+
+module use /soft/modulefiles
+module load frameworks                 # oneAPI + torch(xpu) + Python
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT    # 12 tiles = 12 devices
+export TMPDIR=/tmp                      # keep AF_UNIX socket paths short
+
+# venv created with --system-site-packages against the frameworks Python so
+# torch/IPEX stay importable (see SKILL.md). Activate AFTER `module load`.
+source "$PROJECT_DIR/.venv/bin/activate"
+
+HOST=$(hostname -i | awk '{print $1}')
+PORT=8000
+
+echo "AgenticExecution MCP (single node, 1 tile) -> http://${HOST}:${PORT}/mcp"
+
+# Bind to the routable HSN IP so other compute-node jobs can reach it.
+AGENTIC_EXECUTION_OUTPUT=./execution_output \
+python -m agentic_execution.mcp_server \
+    --transport http --host "$HOST" --port "$PORT" \
+    > agentic-exec-mcp.log 2>&1
