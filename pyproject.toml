@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-execution"
+version = "0.1.0"
+description = "Agentic QM-derived force-field parameterization."
+requires-python = ">=3.12"
+dependencies = [
+    # --- Scientific / cheminformatics core ---
+    "numpy>=2.5",
+    "scipy>=1.18",
+    "rdkit>=2026.3.3",
+    "pydantic>=2.13",
+
+    # --- QM engine (CPU) ---
+    # agents/distributed.py imports these directly; without them not one QM
+    # action can run. gpu4pyscf is deliberately NOT here -- it is CUDA-specific
+    # and would make a CPU or Apple-silicon install impossible; see the `gpu`
+    # extra below, and QMAgent(use_gpu=False) for the CPU path.
+    "pyscf>=2.12",
+    "geometric>=1.1",          # the geomeTRIC optimizer backing pyscf.geomopt
+    "pyscf-dispersion>=1.5",   # D3/D4 corrections requested via QMConfig.dispersion
+    "parmed>=4.3",             # reads atom types off the prmtop in fit_torsions_app
+
+    # --- Distributed execution (QMAgent worker side) ---
+    "academy-py>=0.5.0",   # imported as `academy`
+    "parsl>=2026.6.29",
+    "pyyaml>=6.0",
+
+    # --- MCP (externally managed harness) ---
+    # The server half of FastMCP. pydantic-ai already pulls `fastmcp-slim[client]`
+    # for its MCPToolset; `fastmcp` is the same distribution with the client and
+    # server extras, so this adds the server without a second implementation.
+    "fastmcp>=3.4.4",
+
+    # --- LLM orchestration (pydantic-ai + ecosystem capabilities) ---
+    # pydantic-ai-slim is pulled transitively by pydantic-ai / the harness.
+    "pydantic-ai>=2.7",
+    "pydantic-ai-harness>=0.6.0",
+    "pydantic-ai-backend>=0.2.15",       # imported as `pydantic_ai_backends`
+    "summarization-pydantic-ai>=0.1.10", # imported as `pydantic_ai_summarization`
+    "pydantic-ai-shields>=0.3.4",
+    "pydantic-ai-skills>=1.1.0",
+    "pydantic-ai-todo>=0.2.6",
+    "pydantic-deep>=0.3.35",             # imported as `pydantic_deep`
+    "subagents-pydantic-ai>=0.2.8",
+]
+
+[project.scripts]
+# So an MCP client can spawn the server without knowing the module path.
+agentic-execution-mcp = "agentic_execution.mcp_server:main"
+
+[project.optional-dependencies]
+# Dev/test dependencies. Install (editable) with uv:
+#   uv pip install -e '.[dev]'
+dev = [
+    "pytest>=9.0",
+]
+
+# GPU acceleration for the DFT apps (QMAgent's default, use_gpu=True).
+# Separate from the base install because the wheel is CUDA-12 specific: it has
+# no CPU or Apple-silicon build, so requiring it would make `pip install qmagent`
+# fail on any machine without an NVIDIA GPU. The CPU path (use_gpu=False) needs
+# nothing here.
+#   uv pip install -e '.[gpu]'
+# On a host whose system CUDA is older than 12, also install the runtime wheels:
+#   uv pip install nvidia-nvjitlink-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12 \
+#                  nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cufft-cu12 \
+#                  nvidia-curand-cu12
+gpu = [
+    "gpu4pyscf-cuda12x>=1.6",
+    "cupy-cuda12x>=13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_execution"]
+
+[tool.pytest.ini_options]
+# Keep src on sys.path so tests run even without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

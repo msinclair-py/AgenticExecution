@@ -1,2 +1,6 @@
 # AgenticExecution
-Execution middleware for running agentic frameworks on HPC resources. Harness agnostic and code execution is done via an MCP surface. Execution layer can be manually deployed on any HPC or federated via Globus Compute.
+
+Execution middleware for running agentic frameworks on HPC resources.
+
+Harness agnostic: code execution is exposed through an MCP surface. The package
+can be deployed manually on HPC resources or federated through Globus Compute.
