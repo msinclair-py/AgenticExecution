@@ -1,0 +1,24 @@
+{DESCRIBE EXPERIMENT HERE}
+
+I want you to perform this experiment using all available tools.
+Recommend any other ones you think would be useful! 
+Be as creative as you want while still maintaining scientific accuracy.
+
+If there is a tool you realize would be useful then create a skill for this during this workflow. 
+Use the `globus-compute-mcp` skill to request resources on either or both of ALCF Aurora and Polaris to do all code execution.
+Please make sure we are requesting on the order of {NGPUS} worth of GPU compute, approximating however many nodes this is on the selected compute resource.
+I would want to run this experiment over the course of {LENGTH_OF_EXPERIMENT}.
+
+While running this, save all the reasoning you used to do this please. 
+And make plots as you go for anything you think is interesting for me to know. 
+You can message me with the ntfy skill if there are any exciting updates or you need my approval for something. 
+During night times (5 PM - 8 AM) I may not respond right away so save any gates for work hours. 
+Keep things running all the time but save gate checks for when I can see them.  
+Please decide this yourself; I think having as many parallel strategies as you want is fine.
+
+You can message me whenever but only have gates during work hours. 
+Make sure you don't stop reasoning without my input. 
+You can do other things while you wait for me.
+
+Please periodically generate reports of our progress as an artefact and share them with me.
+Save plots of our data locally, and ensure that our decision flow is tracked.

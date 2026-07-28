@@ -1,264 +1,195 @@
 ---
 name: md-simulation
-description: Run molecular dynamics and binding free-energy analysis on protein / protein-complex / protein-ligand systems with the molecular_simulations package (AmberTools build + OpenMM simulate + MM-PBSA). Covers building AMBER topologies (explicit OPC / implicit GB / protein-ligand GAFF2 / glycoprotein), running the minimize→heat→equilibrate→NPT-production pipeline with automatic restart, RMSD stability assessment of a binder against its target, and MM-P(G)BSA ΔG_binding with frame-parallelism. Self-contained: the full fold→MD→ΔG binder pipeline including glycan prep lives here. Use to assess whether a designed binder stays bound and estimate its affinity. Upstream: chai-folding produces the PDB; for the folding confidence score see chai-folding's ipSAE.
-license: MIT-style (molecular_simulations; this skill text is project-local)
-metadata:
-    skill-author: local project skill (AgenticExecution)
-    verified-against: molecular_simulations.build / .simulate / .analysis; AmberTools; OpenMM
+description: >-
+  Gold-standard stability + binding-free-energy assessment of a folded
+  protein-binder complex via molecular dynamics: build a solvated system with
+  AmberTools, propagate with OpenMM on GPU (heat -> equilibrate -> production),
+  measure backbone RMSD of the binder relative to the aligned target with
+  MDAnalysis, and — only if the complex stays stable — run MMPBSA/MM-GBSA
+  end-point free energy over the trajectory. Use as the expensive final rank on
+  top candidates after cheap folding + contact filters. Hours-scale, needs a
+  pre-provisioned GPU env with OpenMM + AmberTools ($AMBERHOME) + MDAnalysis.
 ---
 
-# Molecular Dynamics & Binding Free Energy
+# Molecular dynamics stability + binding free energy (OpenMM + AmberTools + MDAnalysis)
 
-## Overview
+Assess a folded complex the expensive, high-fidelity way: build a solvated
+Amber system from the complex PDB, run an OpenMM MD trajectory (heat, multi-cycle
+equilibration, microsecond-scale production), then judge stability by the binder's
+backbone RMSD with the target aligned. If the complex holds together (mean
+backbone RMSD below a cutoff) you run MMPBSA/MM-GBSA over the trajectory to obtain
+a binding free energy in kcal/mol; if it drifts apart, the binding energy is
+reported as zero. This is the gold-standard rank — hours on a GPU per complex —
+so reserve it for the top handful of candidates that already survived cheap
+folding and contact filters. **Fold the complex first** (this skill consumes the
+complex PDB); downstream, filter-binders buckets on the stability/energy it emits.
 
-`molecular_simulations` turns a structure into an MD trajectory and a binding
-free energy in three stages:
+This is a **self-contained, instruction-only skill**. There is no wrapper script
+and no project dependency — you (the agent) drive OpenMM, AmberTools, and
+MDAnalysis directly. The procedure below is everything you need.
 
-1. **Build** (`.build`) — AmberTools (`tleap`/`cpptraj`/`antechamber`) parameterize
-   the system → `system.prmtop` + `system.inpcrd` (+ `system.pdb`).
-2. **Simulate** (`.simulate`) — OpenMM runs minimize → heat → restrained
-   equilibration → NPT production, with checkpoint/restart.
-3. **Analyze** — RMSD stability (MDAnalysis) gates whether the binder stayed
-   bound; if so, **MM-P(G)BSA** estimates ΔG_binding.
+## When to use it
 
-**Requires AmberTools with `$AMBERHOME` set** (builders and MM-PBSA resolve
-`tleap`/`cpptraj`/`mmpbsa_py_energy` under `$AMBERHOME/bin`; unset → `ValueError`).
-Simulation runs on GPU (`CUDA`/`OpenCL`) or `CPU` — device-agnostic via
-`scripts/_device.py`.
+- You have a small set of top folded complexes and want a high-fidelity
+  stability + binding-energy verdict before committing wet-lab or compute budget.
+- You want the expensive, trajectory-based tiebreaker after folding and
+  contact-based filters have already narrowed the pool.
 
-The binder pipeline in one line: **fold (chai) → build → simulate → RMSD gate →
-MM-PBSA**. `scripts/fold_to_dG_pipeline.py` is the whole thing end to end.
+Do **not** use it for triage over many candidates — it is hours-scale per
+complex. Cheap filters (folding confidence, contact-eval, peptide-descriptors)
+belong earlier. Do not use it if you have no folded complex PDB yet.
 
----
+## Setup — build the environment (once per project)
 
-## 1. Build the system (`molecular_simulations.build`)
+This tool cannot be pip-bootstrapped inline; build a conda env once, on a login
+node, into shared project storage — see `../ENVIRONMENTS.md` for the
+cross-cutting HPC rules.
 
-Builders write `system.prmtop`/`system.inpcrd`/`system.pdb` into `path` and move
-intermediates into `path/build/`. Point the simulator at `path`.
-
-**Explicit solvent (most common)** — cubic OPC box, neutralized, ~150 mM NaCl:
-```python
-from pathlib import Path
-from molecular_simulations.build import ExplicitSolvent
-
-ExplicitSolvent(
-    path=Path('out/'),           # where system.prmtop/.inpcrd land
-    pdb=Path('complex.pdb'),
-    padding=10.0,                # Å water padding on the longest axis
-).build()
+```bash
+conda create -n <proj>-md -c conda-forge python=3.11 openmm ambertools mdanalysis pdbfixer -y
+conda activate <proj>-md
+export AMBERHOME=$CONDA_PREFIX        # MMPBSA / MM-GBSA needs AmberTools
 ```
-Options: `disulfide_residues=[23, 88]` (force CYX + let tleap bond — good for
-binder design where distance-based detection is unwanted); `glycans=True` (see
-§2); `rna`/`dna`/`phos_protein`/`mod_protein` toggle extra `leaprc`;
-`polarizable=True` (ff15ipq/SPC-Eb); `debug=True` (write `tleap.in` to disk to
-inspect a failed build).
 
-**Implicit solvent (GB)** — no water box, `mbondi3` radii (pair with
-`ImplicitSimulator`):
-```python
-from molecular_simulations.build import ImplicitSolvent
-ImplicitSolvent(path='out/', pdb='protein.pdb', protein=True).build()
+- **OpenMM** — pick the platform for your accelerator: `CUDA` for NVIDIA GPUs,
+  `OpenCL` for Intel XPUs.
+- **AmberTools** — provides `tleap`, `sander`/`pmemd`, and `MMPBSA.py` for the
+  end-point free energy; needs `$AMBERHOME` exported. Its force fields ship with
+  the conda package, so **no separate weights download** — this runs fine on an
+  offline compute node once built.
+- **pdbfixer** — prep raw PDBs before `tleap` (add missing atoms / hydrogens).
+- **MDAnalysis** — the RMSD analysis.
+
+Gate on all of it before doing anything; if the check fails, stop and rebuild the
+env rather than attempting to install AmberTools or a CUDA OpenMM on the fly.
+
+```bash
+python -c "import openmm, MDAnalysis, os; assert os.environ.get('AMBERHOME'), 'AMBERHOME unset'" \
+  2>/dev/null && echo ready || echo "NOT READY: need pre-provisioned OpenMM + AmberTools (\$AMBERHOME) + MDAnalysis env"
 ```
-Note: **implicit solvent cannot handle glycans** (no cpptraj sugar prep → tleap
-can't form glycosidic bonds). Glycoproteins must use explicit solvent.
 
-**Protein–ligand complex** — GAFF2 + AM1-BCC charges via antechamber:
+## Procedure
+
+Reproduce the pipeline directly on OpenMM + Amber. Four stages.
+
+### 1. Build the solvated system (AmberTools `tleap`)
+
+From the complex PDB, build an Amber topology + coordinates. Choose the solvent
+model by the speed/fidelity you need:
+
+- **ExplicitSolvent** — solvate in a TIP3P water box (+ neutralizing ions),
+  highest fidelity, slowest. Produces `system.prmtop` + `system.inpcrd`.
+- **ImplicitSolvent** — GB continuum (no explicit waters), much faster, lower
+  fidelity. Also produces a `system.prmtop`.
+
+Drive `tleap` with a leap script that loads the protein force field
+(e.g. `ff14SB`), reads the PDB, (for explicit) solvates + adds ions, and
+`saveAmberParm` to write `system.prmtop`. Keep the prmtop — it is a durable
+artifact and the input to MMPBSA later.
+
+### 2. Simulate with OpenMM: build -> heat -> equilibrate -> production
+
+Load the prmtop/inpcrd into OpenMM, pick the platform, then run the staged
+schedule. Key default parameters to document and carry:
+
+- **heat_steps = 100_000** (~200 ps at a 2 fs timestep) — warm from low T to 300 K.
+- **equil_steps = 1_250_000** (~2.5 ns) per cycle, with **n_equil_cycles = 3**
+  (restrain -> relax over cycles).
+- **prod_steps = 250_000_000** (~1 µs) at **prod_dt = 0.004 ps** (4 fs, requires
+  hydrogen-mass repartitioning) — the production run, saved to `prod.dcd`.
+
 ```python
-from molecular_simulations.build import ComplexBuilder
-ComplexBuilder(path='out/', pdb='protein.pdb', lig='ligand.sdf', padding=12.0).build()
+import openmm as mm
+import openmm.app as app
+from openmm import unit
+
+PLATFORM = "CUDA"   # "CUDA" for NVIDIA, "OpenCL" for Intel XPU
+prmtop = app.AmberPrmtopFile("system.prmtop")
+inpcrd = app.AmberInpcrdFile("system.inpcrd")
+
+system = prmtop.createSystem(
+    nonbondedMethod=app.PME,           # use app.GBn2/implicit for ImplicitSolvent
+    nonbondedCutoff=1.0*unit.nanometer,
+    constraints=app.HBonds,
+    hydrogenMass=1.5*unit.amu,         # HMR enables the 4 fs production step
+)
+integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond,
+                                         0.004*unit.picoseconds)
+sim = app.Simulation(prmtop.topology, system, integrator,
+                     mm.Platform.getPlatformByName(PLATFORM))
+sim.context.setPositions(inpcrd.positions)
+sim.minimizeEnergy()
+
+# heat: ~200 ps @ 2 fs (swap to a 0.002 ps integrator for the heat/equil phases)
+sim.step(100_000)
+# equilibrate: 3 cycles of ~2.5 ns each, relaxing restraints between cycles
+for _ in range(3):
+    sim.step(1_250_000)
+# production: ~1 us @ 4 fs, write the trajectory
+sim.reporters.append(app.DCDReporter("prod.dcd", 25_000))
+sim.step(250_000_000)
 ```
-Ligand residues become `LG0`, `LG1`, …; reuse params with
-`lig_param_prefix='/path/params/ligand'`; a `LigandError` means antechamber/SQM
-failed (check `build/*_sqm.out` for "Calculation Completed").
 
-Helpers: `convert_cif_with_gemmi(cif)` / `convert_cif_with_biopython(cif)`
-(CIF→PDB, since Chai emits CIF but you converted to PDB during scoring);
-`add_chains(pdb, first_res, last_res)` (assign A/B by residue range).
+### 3. Stability via backbone RMSD (MDAnalysis)
 
----
-
-## 2. Glycoproteins (two paths)
-
-A Chai glycoprotein fold carries sugar residues (NAG, MAN, …) in PDB naming.
-AMBER needs GLYCAM naming + explicit glycosidic/disulfide bonds. Two options:
-
-**(a) Let `ExplicitSolvent(glycans=True)` do it (recommended).** Keep the
-structure in Chai's PDB sugar names; the explicit builder's `cpptraj
-prepareforleap` renames to GLYCAM and forms the bonds itself. **Pre-renaming to
-GLYCAM would hide the sugars from cpptraj** — don't. For the MM-PBSA fragment
-split to be clean, move the binder chain to *last* first (see
-`scripts/prep_glycoprotein.py`). Also force `glycans=True`.
-
-**(b) `GlycanConverter` (manual / inspectable).** Detects glycosidic + disulfide
-bonds by geometry, assigns GLYCAM names, and writes a renamed PDB + a `tleap`
-script with the bond commands:
-```python
-from molecular_simulations.build.glycam_mapper import GlycanConverter  # project material
-result = GlycanConverter().convert_pdb('fold.pdb', output_dir='prep/', mol_name='PROT')
-# result['glycam_pdb'], result['leap_script'], result['bond_commands'], ...
-```
-Use `mol_name='PROT'` for ExplicitSolvent, `'prot'` for ImplicitSolvent (must
-match the tleap variable). See `references/glycan_reference.md`.
-
-> The `GlycanConverter` module lives in the `bindify` toolbelt materials
-> (`materials/glycam_mapper.py`); path (a) needs only `molecular_simulations`.
-
----
-
-## 3. Simulate (`molecular_simulations.simulate`)
-
-`Simulator` reads `system.prmtop`/`.inpcrd` from `path` and runs the full
-pipeline; **re-invoking `run()` after a crash resumes** from the last checkpoint
-(built for preemptible HPC queues).
+Load `system.prmtop` + `prod.dcd`, strip solvent, split target vs binder by
+fragments (**the binder is the last fragment**), and compute the binder's
+backbone RMSD **with the target aligned**:
 
 ```python
-from pathlib import Path
-from molecular_simulations.simulate import Simulator
-
-ns, prod_dt = 100, 0.004                    # production ns; 4 fs timestep (HMR)
-prod_steps = int(ns / prod_dt * 1000)       # ns -> steps  (1 ns = 250_000 steps)
-
-Simulator(
-    path=Path('out/'),
-    equil_steps=1_250_000,                  # 2.5 ns @ 2 fs (default)
-    prod_steps=prod_steps,
-    temperature=300.0,
-    platform=resolve_md_platform(),         # 'CUDA' | 'OpenCL' | 'CPU'
-    device_ids=[0],
-).run()
-```
-`run()`: skips equilibration if `eq.*` exist; else minimize → slow-heat 5 K→T →
-relax backbone restraints in 5 stages → NPT for `n_equil_cycles`; then production
-from the eq checkpoint (resumes from `prod.rst.chk`, reading `prod.log` for
-remaining steps). Outputs: `prod.dcd` (frames every `prod_reporter_frequency`),
-`prod.log`, checkpoints. Key args: `heat_steps`, `prod_dt_in_ps=0.004`,
-`hydrogen_mass_repartitioning=1.5`, `force_constant=10.0`, `membrane=True`
-(anisotropic barostat), `ff='charmm'`.
-
-**GPU pinning:** on `CUDA` with `CUDA_VISIBLE_DEVICES` set (by Parsl/scheduler),
-the in-process index is forced to `0` — leave `device_ids=[0]` and let the
-scheduler mask GPUs.
-
-**Implicit (GB):**
-```python
-from molecular_simulations.simulate import ImplicitSimulator
-from openmm.app import GBn2
-ImplicitSimulator(path='out/', implicit_solvent=GBn2, prod_steps=100_000_000,
-                  solvent_dielectric=78.5).run()
-```
-Minimization only: `Minimizer(topology, coordinates, out='min.pdb', platform, device_ids).minimize()`.
-
-**Simulation length guidance:** quick stability screen 1–10 ns; committed
-evaluation 25–50 ns; gold-standard ranking 100+ ns (or multi-replica). MM-PBSA
-estimates stabilize with more sampling.
-
----
-
-## 4. RMSD stability gate
-
-Before spending MM-PBSA compute, check the binder actually stayed bound. Align
-each frame on the **target backbone**, then measure the **binder heavy-atom
-RMSD** vs the start. Because alignment is on the target only, this RMSD captures
-both conformational distortion *and* rigid-body drift away from the site.
-
-```python
-import numpy as np, MDAnalysis as mda
+import numpy as np
+import MDAnalysis as mda
 from MDAnalysis.analysis.rms import RMSD
 
-u = mda.Universe('out/system.prmtop', 'out/prod.dcd')
-solute = u.atoms[~np.isin(u.atoms.resnames, SOLVENT_RESNAMES)]   # strip water/ions
-*target_frags, binder = solute.fragments      # binder is the LAST fragment
-target = solute - binder
-first, last = target.residues.resids[0], target.residues.resids[-1]
-binder_sel = 'not type H and resid ' + ' '.join(map(str, binder.residues.resids))
+u = mda.Universe("system.prmtop", "prod.dcd")
+solute = u.select_atoms("not resname WAT HOH Na+ Cl- K+")   # strip solvent by resname
+fragments = solute.fragments
+target = fragments[0]
+binder = fragments[-1]                                       # binder = last fragment
 
-R = RMSD(solute, select=f'backbone and resid {first} to {last}',
-         groupselections=[binder_sel])
+R = RMSD(u, select="backbone",                              # align on the target backbone
+         groupselections=[f"backbone and group binder"],
+         binder=binder)                                      # report binder RMSD in the aligned frame
 R.run()
-binder_rmsd = R.rmsd[:, -1]                    # per-frame binder heavy-atom RMSD
-mean_rmsd = binder_rmsd.mean()
+binder_rmsd = R.results.rmsd[:, -1]                          # per-frame binder backbone RMSD (Å)
+rmsd_mean, rmsd_std = float(binder_rmsd.mean()), float(binder_rmsd.std())
 ```
-If `mean_rmsd < rmsd_cutoff` (default 5.0 Å; tighten to 2–3 Å for small/rigid
-binders, loosen to 5–7 Å for large/flexible ones) the complex is "stably bound"
-→ proceed to MM-PBSA; otherwise flag it dissociated and skip. This is why the
-**binder must be the last fragment** — hence the binder-last reordering in
-glycan prep. Full helper: `scripts/rmsd_stability.py`.
 
----
+### 4. Conditional binding free energy (MMPBSA / MM-GBSA)
 
-## 5. MM-P(G)BSA binding free energy
-
-`MMPBSA` slices the solvated complex into complex/receptor/ligand topologies,
-runs GB **and** PB energies per frame (frame-parallel), and reports ΔG. The
-`selections` are two cpptraj residue ranges (receptor, ligand) — build them from
-the target/binder resids.
+- If **rmsd_mean < rmsd_cutoff** (default **5.0 Å**) the complex is stable — run
+  MMPBSA/MM-GBSA over `prod.dcd` (via AmberTools `MMPBSA.py` with the complex,
+  receptor, and ligand prmtops) to get the binding free energy and its error, in
+  kcal/mol.
+- Otherwise the complex is judged unstable and `binding_free_energy = [0, 0]`.
 
 ```python
-from molecular_simulations.simulate import MMPBSA
-
-mmpbsa = MMPBSA(
-    top='out/system.prmtop',
-    dcd='out/prod.dcd',
-    selections=[target_sel, binder_sel],   # cpptraj ':1-120', ':121-165'
-    n_cpus=8,                              # frame-level parallelism
-    parallel_mode='frame',                 # 'frame' (fast) | 'serial'
-    # amberhome=None -> $AMBERHOME
-)
-mmpbsa.run()
-print(mmpbsa.free_energy)                  # [mean, std] ΔG_binding (PB), kcal/mol
+if rmsd_mean < 5.0:
+    # AmberTools MMPBSA.py over prod.dcd -> parse FINAL DELTA G + stderr
+    binding_free_energy = [dG_value, dG_error]   # kcal/mol
+else:
+    binding_free_energy = [0.0, 0.0]
 ```
-Format resid lists for cpptraj with `MMPBSA.format_for_cpptraj(resids)` (`:1-120`
-style, collapsing contiguous ranges). If `selections=None`, MM-PBSA infers
-receptor vs ligand from `OXT` chain termini (last chain = ligand). Writes
-`statistics.json` (per-term GB/PB means) and `deltaG.txt`; `free_energy` is the
-PB **∆G Binding** `[mean, std]`. Note this is a solute-only MM-PBSA (bonded terms
-cancel; it verifies that as a sanity check). See `references/mmpbsa_reference.md`.
 
----
+## Interpreting the result
 
-## Best Practices
+- **rmsd = [mean, std]** — the stability score. Low mean backbone RMSD (below the
+  cutoff) means the binder stayed docked; a large mean means it drifted / unbound.
+- **binding_free_energy = [value, error]** kcal/mol — more negative is stronger
+  predicted binding; only meaningful when the complex was stable. `[0, 0]` is the
+  sentinel for "too unstable to score", not "zero affinity".
+- **Artifacts** — keep `system.prmtop` (needed to re-analyze or re-run MMPBSA) and
+  `prod.dcd` (the trajectory).
+- Rank candidates first by stability (RMSD), then by binding free energy among the
+  stable ones.
 
-- **`$AMBERHOME` must be set** for builds and MM-PBSA.
-- **Explicit solvent for glycoproteins**; implicit can't form glycosidic bonds.
-- **Keep glycans in Chai PDB naming into `ExplicitSolvent(glycans=True)`** — let
-  cpptraj rename to GLYCAM; don't pre-rename.
-- **Binder must be the last chain/fragment** — the RMSD split and MM-PBSA
-  ligand selection depend on it. Reorder before building glycoproteins.
-- **RMSD-gate before MM-PBSA** — don't spend the compute on a dissociated binder.
-- **`run()` is restartable** — re-invoke to resume; ideal for preempt queues.
-- **Steps from time:** 1 ns = 250 000 steps at the default 4 fs production dt.
-- **One `Simulator` = one replica/dir**; fan replicas out with Parsl (see the
-  `parsl-hpc` skill in the molecular-simulations repo).
-- **Device-agnostic:** `resolve_md_platform()` maps xpu→OpenCL, cuda→CUDA, else CPU.
+## Notes
 
-## Common Pitfalls
-
-1. `$AMBERHOME` unset → builder/MM-PBSA `ValueError`.
-2. Glycoprotein in implicit solvent → disconnected sugars ("faulty Connection
-   atoms"). Use explicit + `glycans=True`.
-3. Pre-renaming sugars to GLYCAM before `ExplicitSolvent(glycans=True)` → cpptraj
-   can't see them, bonds never form.
-4. Binder not the last fragment → RMSD/MM-PBSA split grabs the wrong molecule.
-5. Skipping the RMSD gate → MM-PBSA on a drifted binder returns meaningless ΔG.
-6. Passing a CIF to the builder → convert to PDB first (`convert_cif_with_gemmi`).
-7. Fighting GPU pinning under Parsl → leave `device_ids=[0]` when
-   `CUDA_VISIBLE_DEVICES` is set.
-8. Too-short production for MM-PBSA → unconverged, high-variance ΔG.
-
-## Resources
-
-### references/
-- `mmpbsa_reference.md` — selections, GB/PB terms, outputs, ΔG interpretation.
-- `glycan_reference.md` — GLYCAM naming, bond detection, the two prep paths.
-- `analysis_reference.md` — RMSD, ipSAE, SASA, interaction-energy pointers.
-
-### scripts/
-- `_device.py` — `resolve_device()` / `resolve_md_platform()`.
-- `build_explicit.py` — explicit OPC solvent build.
-- `build_implicit.py` — implicit GB build.
-- `build_complex_ligand.py` — protein-ligand (GAFF2) build.
-- `prep_glycoprotein.py` — reorder binder last + build with `glycans=True`.
-- `run_production.py` — minimize→equil→production (restartable).
-- `rmsd_stability.py` — binder RMSD stability gate.
-- `run_mmpbsa.py` — MM-P(G)BSA ΔG from a trajectory.
-- `fold_to_dG_pipeline.py` — end-to-end: PDB → build → simulate → RMSD → MM-PBSA.
+- Inputs you supply: the complex PDB, a workdir, the OpenMM platform, `$AMBERHOME`,
+  the solvent model (explicit vs implicit — the main speed/fidelity dial), and the
+  `rmsd_cutoff`.
+- **Deciding which complexes earn an MD run is your job as the agent.** This is the
+  expensive gold-standard step: run it only on the top candidates that already
+  passed folding + contact filters, and hand the resulting stability/energy to a
+  filter-binders bucketing step. This skill only computes the MD verdict for one
+  complex.

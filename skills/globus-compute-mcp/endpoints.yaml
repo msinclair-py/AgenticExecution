@@ -1,0 +1,46 @@
+# Globus Compute endpoints this MCP server can dispatch to.
+#
+# Named by TASK CLASS, not just machine. The reference implementation
+# (ramanathanlab/deepdrivewe-academy, examples/openmm_ntl9_hk_multisite) uses a
+# GPU simulation endpoint and a SEPARATE CPU inference endpoint, because the two
+# want different allocations and different worker counts: GPU work wants one
+# worker pinned per accelerator, single-threaded analysis wants few workers and
+# no GPU reservation. Mirror that -- send folding/MD to `*-gpu` and trajectory
+# analysis, SASA/patch computation and statistics to `*-cpu`.
+#
+# The tools take `endpoint='aurora-gpu'`, never a raw UUID.
+#
+# Fill in `uuid` after the one-time bootstrap:
+#     ssh <machine>
+#     globus-compute-endpoint start <endpoint_name>   # browser auth, once
+#     globus-compute-endpoint list                    # copy the UUID
+#
+# An entry with a null uuid is skipped in --exchange globus (reported on stderr
+# at startup and as `configured: false` by list_endpoints). In --exchange local
+# the uuid is irrelevant -- every endpoint becomes a local ThreadPoolExecutor.
+#
+# PATH RULES -- these bite hard:
+#   base_dir / output_dir are paths ON THE REMOTE HOST. The agent chdirs to
+#   base_dir at startup so RELATIVE paths resolve there. Never let a laptop
+#   path leak into them: config objects are pickled across the network without
+#   .resolve() normalisation, so a laptop path arrives intact and silently
+#   means nothing on /flare.
+#   local_base_dir / local_output_dir are used ONLY in --exchange local.
+
+default: aurora-gpu
+
+endpoints:
+
+  # ---------------- Aurora ----------------
+  aurora-gpu:
+    uuid: c4456e74-942a-4410-a814-9be3e5e8a4fc
+  aurora-cpu:
+    uuid: d80a6d60-de99-4da9-8e66-9cd7ddb20e6a
+    task_class: cpu
+    machine: ALCF Aurora
+    notes: >-
+      Analysis + polling. Exists because polling is itself a Globus Compute
+      task: with the GPU endpoint saturated, a status check queues behind the
+      science it is meant to watch. Warm on purpose (min_blocks 1). No
+      accelerators - pinning CPU workers to GPU tiles would starve the GPU
+      endpoint.

@@ -1,54 +1,146 @@
 # Skills
 
-On-demand skills for the AgenticExecution code-execution harness. Each
-subdirectory holds a `SKILL.md` (name + description frontmatter the agent loads
-when a task matches), plus `references/` (deep-dive docs loaded as needed) and
-`scripts/` (runnable, importable templates). Skills teach the **underlying
-libraries** so an LLM can author `execute_code` snippets against the project
-environment — device-agnostic (`resolve_device()` → xpu/cuda/cpu) throughout.
+Portable, **instruction-only** skills for running scientific campaigns on HPC.
+Each skill is a self-contained procedure over a **base library** (raw `requests`,
+MDAnalysis, `peptides`, ProteinMPNN, chai_lab, Chroma, OpenMM, PySCF, RDKit,
+faiss, …) — **none require this package**. Any agentic
+harness that can read a `SKILL.md` and run code (Claude Code, Codex, Hermes, …)
+can use them; a harness with a code sandbox and the base library installed needs
+nothing else.
 
-## Biomolecular design skills
+- `ENVIRONMENTS.md` — how to pre-provision the heavy GPU environments on a
+  cluster (login-node installs, shared weight caches, CUDA/torch matching,
+  offline compute nodes). Read this before running anything GPU-heavy.
+- `references/site-profiles.md` — per-machine facts (nodes, queues, pinning
+  vars, filesystems) for the HPC execution skills.
 
-| Skill | Use it for | Underlying lib |
-|-------|-----------|----------------|
-| [chroma-diffusion](chroma-diffusion/SKILL.md) | De novo binder **backbone** design against a target hotspot | `chroma` |
-| [proteinmpnn](proteinmpnn/SKILL.md) | **Inverse folding** — design sequences for a backbone | `protein_mpnn_utils` |
-| [protein-language-model-design](protein-language-model-design/SKILL.md) | **pLM sequence design** — infill / extend / rank sequences (no structure) | `transformers` (ESM-2) |
-| [chai-folding](chai-folding/SKILL.md) | **Fold** sequence → structure (mono/complex/ligand/glycan), ipSAE scoring | `chai_lab` |
-| [md-simulation](md-simulation/SKILL.md) | **MD + MM-PBSA** — stability & binding free energy | `molecular_simulations` |
-| [rag](rag/SKILL.md) | **Literature RAG** — mine hotspots / PTMs / known binders | `distllm` + `faiss` |
+## What "instruction-only" means here
 
-### Typical binder-design pipeline
+A skill carries the *know-how*, not a wrapper: what it does, when to use it,
+gated setup (check-before-install), the real procedure/parameters over the base
+library, and how to read the result. The agent writes and runs the few lines
+itself. Deciding which inputs to run on and what to do with the outputs is the
+agent's orchestration job, not the skill's.
+
+## Campaign skills
+
+Narrow, single-step skills — the units an orchestrating agent chains into a
+binder-design campaign.
+
+### Knowledge / lookup (remote HTTP, light)
+| Skill | Base | Purpose |
+|---|---|---|
+| `uniprot` | `requests` → rest.uniprot.org | Fetch a target's sequence / metadata / known interactors |
+| `interactant-sequence` | `requests` → rest.uniprot.org | Accession → amino-acid sequence for interacting partners |
+| `fetch-literature` | `requests` → PubMed / Europe PMC | Gather a literature corpus about a target |
+
+### Retrieval-augmented memory
+| Skill | Base | Purpose |
+|---|---|---|
+| `rag-build-index` | faiss + datasets + MiniLM | Build a searchable vector store over a corpus |
+| `rag-query` | faiss + MiniLM + LLM endpoint | Retrieve + LLM-answer / structured extraction over a store |
+| `experiments-index` | faiss + datasets (fcntl append) | Incrementally index a campaign's own results |
+
+### Analysis / triage (CPU, light)
+| Skill | Base | Purpose |
+|---|---|---|
+| `contact-eval` | MDAnalysis | Interface residues on a target from a folded complex |
+| `peptide-descriptors` | `peptides` | Physicochemical descriptors of a peptide/binder |
+| `developability` | sequence scan + structure check | Is a binder a realistic lab candidate — liabilities, charge/pI, aggregation, immunogenicity flags |
+| `filter-binders` | none (pure logic) | Bucket a binder pool into priority tiers with a survivor guard |
+
+### Generation / structure (GPU, pre-provisioned env)
+| Skill | Base | Purpose |
+|---|---|---|
+| `folding` | chai_lab + ipSAE | Co-fold a target+binder complex, interface confidence |
+| `interactant-folding` | chai_lab (defers to `folding`) | Co-fold target with a natural partner |
+| `cofactor-ligand-setup` | text only (writes a Chai FASTA) | Add metals / cofactors / ligands so the fold is HOLO |
+| `inverse-folding` | ProteinMPNN (`$PROTEINMPNN_PATH`) | Redesign sequences for a fixed backbone/target |
+| `peptide-diffusion` | Chroma | De novo binder backbones conditioned on a hotspot |
+| `peptide-clamp-design` | Chroma (isolated-peptide trick) | Binders that clamp a linear/disordered epitope |
+| `protein-language-explore` | transformers / ESM-2 650M | Extend/infill a sequence via a protein LM |
+
+### Ensembles & simulation (GPU, heavy)
+| Skill | Base | Purpose |
+|---|---|---|
+| `bioemu-ensemble` | BioEmu | Equilibrium-like conformational ensemble — fast ML alternative to MD |
+| `md-simulation` | OpenMM + AmberTools + MDAnalysis | Stability (RMSD) + binding free energy of a complex |
+
+### Screening / bootstrap helpers
+| Skill | Base | Purpose |
+|---|---|---|
+| `seed-binders` | stdlib | Assemble a sanity-filtered starter binder pool (not a dispatch tool) |
+| `peptide-repurposing-screen` | chai_lab at scale | Screen a known-peptide database against a target; benchmark de novo designs |
+
+### Working with the user
+| Skill | Base | Purpose |
+|---|---|---|
+| `supervisor` | none (decision lens) | Pressure-test a decision against PI-level scientific standards before committing |
+| `ntfy-notify` | ntfy HTTP | Two-way phone messaging when the user is away from the terminal |
+
+## Reference skills (broad, library-level)
+
+Wider-scope skills covering a whole library rather than one campaign step. Use
+these when you need a capability the narrow skill doesn't cover — an unusual
+folding condition, a different ProteinMPNN weight set, a QM calculation.
+
+| Skill | Base | Purpose |
+|---|---|---|
+| `chai-folding` | chai_lab | Full range of Chai-1 folding — multimers, ligands/SMILES, glycans/PTMs, restraint files; superset of `folding` |
+| `proteinmpnn` | ProteinMPNN | In-process + CLI paths, fixed positions, noise-level/soluble weight variants; superset of `inverse-folding` |
+| `chroma-diffusion` | Chroma | Conditioner composition (Substructure / Inflate / Subsequence); superset of `peptide-diffusion` |
+| `protein-language-model-design` | ESM-2 | Infill, terminal extension, and pseudo-log-likelihood ranking; superset of `protein-language-explore` |
+| `rag` | distllm + faiss | End-to-end corpus → index → query, incl. generator-backend choice; spans `rag-build-index` + `rag-query` |
+| `pyscf` | PySCF / gpu4pyscf | DFT/SCF, geometry optimization, ESP grids for RESP charges, implicit solvent |
+| `rdkit` | RDKit | Molecular I/O, SMARTS substructure search, 2D/3D coords, conformers, reactions |
+
+## HPC execution
+
+| Skill | Base | Purpose |
+|---|---|---|
+| `polaris-jobs` | ssh + PBS | Submit/monitor A100 jobs on ALCF Polaris over one persistent MFA'd SSH connection; correct mpiexec + `set_affinity_gpu_polaris.sh` GPU binding |
+| `globus-compute-mcp` | globus-compute + academy + fastmcp | FastMCP runs *locally*, dispatching to Globus Compute endpoints — no SSH per call, no tunnel, no inbound port, no MFA prompt |
+
+Two ways to reach the compute, in increasing decoupling:
+
+1. **`polaris-jobs`** — *operational*. Open a single multiplexed SSH connection
+   (ControlMaster, authenticated once with an MFA token because ALCF requires a
+   one-time passcode per login), then drive `qsub`/`qstat` and file staging over
+   it non-interactively. It documents the machine's node hardware, queues, and
+   — the part jobs get wrong — the exact `mpiexec` affinity lines.
+2. **`globus-compute-mcp`** — *federated*. The MCP server is local and endpoints
+   dial outbound to the Globus service, so nothing has to be reachable inside the
+   facility network, the model stays loaded across calls, and the endpoint
+   survives a job hitting walltime.
+
+## A typical campaign flow (agent-orchestrated)
 
 ```
-rag (mine target: hotspots, PTMs, known binders)
-        │
-        ▼
-chroma-diffusion  ──backbones──►  proteinmpnn  ──sequences──►  chai-folding
-   (design bb at hotspot)          (inverse fold)              (fold + ipSAE)
-                                                                    │
-                                                              best PDB │
-                                                                    ▼
-                                                            md-simulation
-                                                        (RMSD gate → MM-PBSA ΔG)
+uniprot → (fetch-literature → rag-build-index → rag-query) to find hotspots
+        → interactant-sequence → interactant-folding → contact-eval  (validate hotspots)
+seed-binders / peptide-diffusion / peptide-clamp-design
+        → inverse-folding → folding (+ cofactor-ligand-setup for holo targets)
+        → contact-eval + peptide-descriptors + developability → filter-binders
+        → md-simulation on survivors → filter-binders
+        → experiments-index (remember everything)
 ```
 
-Each stage's output feeds the next: Chroma backbones → ProteinMPNN sequences →
-Chai co-folds + ipSAE-scores them → MD checks the binder stays bound and
-estimates ΔG_binding. RAG runs upstream to seed the campaign (epitope residues,
-glycosylation sites, existing binders).
+The agent drives this loop; the skills are the steps. `supervisor` is consulted
+at the decision points between them, and `peptide-repurposing-screen` supplies
+the baseline the designs are judged against.
 
-`protein-language-model-design` is a second, **structure-free** sequence-design
-source that sits alongside `proteinmpnn`: given an existing hit it infills or
-extends the sequence with ESM-2 and can rank any candidate pool by
-pseudo-log-likelihood — a fast way to diversify or triage sequences before
-folding them with `chai-folding`.
+## Notes and caveats
 
-## Other skills
-
-- [pyscf](pyscf/SKILL.md) — quantum chemistry (DFT/SCF, ESP/RESP, torsion scans).
-- [rdkit](rdkit/SKILL.md) — cheminformatics (I/O, SMARTS, conformers, reactions).
-- [deploy-polaris](deploy-polaris/SKILL.md) — scale the code-execution MCP server
-  across an ALCF Polaris PBS allocation with Parsl (NVIDIA A100, 4 GPUs/node).
-- [deploy-aurora](deploy-aurora/SKILL.md) — the same on ALCF Aurora (Intel Max,
-  12 tiles/node, `frameworks` module, PBS Pro).
+- The heavy GPU/sim skills (`folding`, `peptide-diffusion`, `md-simulation`,
+  `inverse-folding`, `protein-language-explore`, `bioemu-ensemble`) require
+  pre-provisioned environments with model weights and env vars
+  (`$PROTEINMPNN_PATH`, `$AMBERHOME`, `$CHAI_DOWNLOADS_DIR`, `$HF_HOME`); their
+  setup sections say so honestly rather than pretending an inline `pip install`
+  suffices. See `ENVIRONMENTS.md`.
+- `seed-binders` is a bootstrap helper, not a dispatchable tool — flagged as such
+  in its own frontmatter.
+- `experiments-index` genuinely wraps heavy vector-store I/O (faiss + datasets);
+  the skill documents the append procedure but it is not "lightweight."
+- Where a campaign skill and a reference skill overlap, prefer the campaign skill
+  for the standard step and drop to the reference skill when you need a knob it
+  doesn't expose.
