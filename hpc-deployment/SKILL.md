@@ -1,192 +1,117 @@
 ---
 name: hpc-deployment
 description: >-
-  Expose HPC compute to an external MCP harness (Claude Code, Codex, ...) as a
-  single code-execution tool, with zero ssh and zero batch-script submission.
-  A local FastMCP server launches and maintains a pool of academy Agents onto
-  a Globus Compute endpoint, one agent per pinned accelerator; each agent's
-  only capability is running an LLM-authored code payload in a subprocess and
-  returning stdout/stderr/returncode. Use when you want an LLM harness to run
-  work on a supercomputer without the harness (or you) ever touching qsub,
-  sbatch, or an interactive shell on the machine, or when a prior deployment
-  based on submitting a PBS/Slurm batch job is the wrong shape for the
-  problem. Covers the agent (deliberately the only tool it will ever expose),
-  the local MCP server, the pool lifecycle that keeps agents alive across
-  client restarts and non-refreshing Globus credentials, and the diagnostic
-  ladder for telling a wedged pool from a busy one.
+  Deploy a local one-tool MCP code-execution server backed by a user-supplied
+  Globus Compute endpoint. The endpoint's Parsl PBSProProvider provisions
+  user-specified queue, walltime, node and accelerator resources; one Academy
+  code-execution agent is pinned to each allocated GPU/tile.
 license: Apache-2.0
-metadata:
-  verified-against: >-
-    Prior PBS/Slurm-submission variant of this pattern deployed end-to-end on
-    ALCF Aurora 2026-07-24 and driven via a directly-submitted batch job. The
-    Globus Compute pool mechanics (self-retirement, adopt-before-launch,
-    revalidate-and-top-up) verified on ALCF Polaris 2026-07-30..08-02 across
-    four multi-day blind campaigns. This all-Globus-Compute, no-batch-script
-    shape supersedes the earlier PBS-submission variant; re-verify the
-    end-to-end HTTP path (endpoint -> local MCP server -> run_code) against a
-    live endpoint before trusting a big campaign on it.
 ---
 
-# Deploying a code-execution agent on HPC via MCP + Globus Compute
+# Globus Compute → PBSPro → pinned Academy-agent MCP deployment
 
-The pattern: one **academy `Agent`** exposes exactly one capability -- run
-this code payload in a subprocess, return what happened. A **FastMCP** server
-running **locally** (on your laptop, under the harness) launches a *pool* of
-these agents onto a **Globus Compute endpoint** and exposes that single
-capability as one MCP tool. An external harness connects to the local server;
-the harness generates code, the tool relays it to a pinned accelerator, and
-that's the entire interface.
+## Sole responsibility
 
-There is no batch script anywhere in this pattern and no direct interaction
-with a scheduler. Getting the underlying allocation is the Globus Compute
-endpoint's job -- configured once, out of band, on the HPC side. This skill
-never runs `qsub`, `sbatch`, or opens an interactive session on the machine;
-everything happens over the Globus Compute SDK's authenticated HTTPS API from
-wherever you run the local MCP server.
+This skill does exactly this, and nothing else:
 
-This is instruction-only and self-contained: nothing here imports a project
-package. `scripts/` holds ready-to-copy files.
+1. Start a **local FastMCP server** with two public tools: `run_code` and bounded, read-only `inspect_filesystem`. The second tool exists solely to provide `ls`/`cat`/`tail`-equivalent worker visibility without SSH.
+2. The server uses a **Globus Compute `Executor`** targeting the **endpoint UUID supplied by the user**.
+3. The submitted endpoint job uses its **Parsl `PBSProProvider`** to request the **user-supplied allocation** (`account`, `queue`, `walltime`, `nodes_per_block`, block count, filesystem/place settings, and worker environment).
+4. Within that allocation, start **one Academy `HpcAgent` per pinned GPU/tile**. Every agent exposes `run_code` plus one constrained, read-only `inspect_filesystem` action. `run_code` executes submitted Python in a subprocess and returns `{stdout, stderr, returncode}`; `inspect_filesystem` supports `ls`, `cat`, and `tail` without giving the harness SSH.
 
-## When to use it
+The harness never uses SSH, `qsub`, `qstat`, `sbatch`, or a campaign-local scheduler wrapper to execute campaign work. The endpoint and its Parsl provider own scheduling. The agent has no domain-specific actions and no arbitrary shell action.
 
-- You want Claude Code / Codex / any MCP client to run work on a
-  supercomputer, with the LLM outside the allocation and the compute inside
-  it, and you cannot or do not want to give the harness (or yourself, per
-  campaign) ssh access to submit anything.
-- You have, or are willing to write, a Globus Compute endpoint on the target
-  machine -- someone with HPC access has already configured and started it.
-- You need **one tool call to land on one pinned accelerator**, with many
-  calls in flight -- the throughput comes from fanning independent calls
-  across a pool, not from one big MPI job.
+## Required inputs
 
-Do **not** use it for a single tightly-coupled MPI simulation -- that's a
-plain `mpiexec` job under whatever the endpoint's environment provides, not
-something this pattern's one-call-per-accelerator model fits.
+Never guess, hard-code, or inherit these from an earlier campaign:
 
-## The one rule this whole pattern exists to enforce
+| Input | Meaning |
+|---|---|
+| `HPC_GLOBUS_ENDPOINT_ID` | Globus Compute endpoint/manager UUID addressed by the local server. |
+| `HPC_POOL_SIZE` | Number of agents to launch; equal to requested addressable GPU/tile count. |
+| `HPC_ENDPOINT_CONFIG_JSON` | JSON object accepted by the endpoint user-config schema; defines PBSPro resources. |
+| `HPC_BASE_DIR` | Campaign directory visible to all workers. |
+| `HPC_CAMPAIGN_ID` | Immutable ID used to isolate agent discovery/adoption. |
 
-**The agent has exactly one action: run a code payload.** Never add a
-domain-specific `@action` to `HpcAgent`. If a campaign needs a new
-capability -- a library, a call out to some other tool, a different kind of
-analysis -- that capability is something the *payload* imports or invokes,
-written by the LLM that's driving the harness. The agent is a relay, not a
-framework: its only job is giving the harness compute it doesn't otherwise
-have. The moment you're tempted to add a second `@action`, that logic belongs
-in the code the harness sends instead.
+Example only—pass keys only when the supplied endpoint's user-config schema permits them:
 
-This is also why there's no per-domain "replace this section" framing in the
-scripts below, unlike a typical template -- there's nothing domain-specific
-to replace.
-
-## Setup (gate before installing)
-
-```bash
-python -c "import academy, fastmcp" 2>/dev/null && echo ready || \
-  pip install 'academy-py>=0.5' 'fastmcp>=3.4' pydantic
+```json
+{
+  "account": "PROJECT",
+  "queue": "debug-scaling",
+  "walltime": "01:00:00",
+  "nodes_per_block": 1,
+  "init_blocks": 1,
+  "min_blocks": 1,
+  "max_blocks": 1,
+  "available_accelerators": 12,
+  "max_workers_per_node": 12,
+  "filesystems": "flare",
+  "place": "scatter"
+}
 ```
 
-`academy` is imported from the **`academy-py`** distribution -- the import
-name and the package name differ. The Globus auth path
-(`HttpExchangeFactory(url, auth_method='globus')`) needs whatever extra
-academy-py ships for Globus auth; check its docs for the current extra name
-if `pip install` fails to resolve it. Parsl is not a direct dependency of
-anything in `scripts/` -- it lives inside the Globus Compute endpoint's own
-engine, which is configured independently of this skill.
+For Aurora, request 12 addressable tiles per node. Endpoint worker initialization must set `ZE_FLAT_DEVICE_HIERARCHY=FLAT` and a distinct `ZE_AFFINITY_MASK` for every pinned worker. `HPC_POOL_SIZE` is `requested nodes × 12` unless the endpoint explicitly exposes another count.
 
 ## Architecture
 
+```text
+MCP harness
+  → local FastMCP server (one public tool: run_code)
+  → Globus Compute Executor(endpoint_id=HPC_GLOBUS_ENDPOINT_ID,
+                            user_endpoint_config=HPC_ENDPOINT_CONFIG_JSON)
+  → endpoint manager / user endpoint
+  → Parsl PBSProProvider allocation
+  → one worker per pinned GPU/tile
+  → one Academy HpcAgent per worker
+  → run_code(payload)
 ```
-external MCP harness ──HTTP──► local FastMCP server ──Globus Compute──► HpcAgent (pinned accelerator)
-   (Claude Code)                (scripts/mcp_server.py)   (HTTPS,        (scripts/hpc_agent.py)
-                                        │                  no ssh)              │
-                                        │                                run_code(payload)
-                                 PoolManager: list[Handle],                     │
-                                 one per pinned accelerator,             subprocess.run(...)
-                                 dispatched round-robin
-```
 
-| Layer | Owns | Runs |
+The endpoint UUID routes the request; it does not select the queue. The endpoint's accepted user configuration is rendered by its Parsl `PBSProProvider` into the PBS request. In multi-user deployments, record both the manager UUID and the spawned user-endpoint UUID: they are different by design.
+
+## Deployment and verification
+
+1. On the endpoint host, inspect the live endpoint user-config schema/template. Confirm that it accepts the requested allocation keys, activates the intended environment, makes `HPC_BASE_DIR` importable, and sets accelerator pinning.
+2. Create/reuse a local uv environment containing `fastmcp`, `globus-compute-sdk`, and `academy-py`.
+3. Run `scripts/preflight.py`. It validates local dependencies/configuration and emits the exact worker-side import/pinning prerequisites without submitting a job.
+4. Start `scripts/mcp_server.py`. Its Academy launch manager uses the Globus Compute `Executor` created with the supplied UUID and endpoint configuration. A local `ThreadPoolExecutor` is invalid: it launches agents locally.
+5. Launch exactly `HPC_POOL_SIZE` `HpcAgent`s. Each bootstrap reports hostname, `HPC_CAMPAIGN_ID`, and device pin; returned handles are rebound to their exchange client before serving MCP calls.
+6. Run `scripts/smoke_test_client.py` against the server. It requires both `run_code` and `inspect_filesystem`, a normal code result, and bounded worker filesystem output.
+7. Submit `HPC_POOL_SIZE` concurrent cheap calls and verify unique `(hostname, device pin)` pairs. If pins duplicate or an agent is absent, stop and repair placement.
+8. On server restart, discover and adopt only agents returning the exact campaign ID; revalidate, prune, and top up only the missing agents through the same Executor/configuration.
+
+The skill supplies `scripts/hpc_agent.py`, `scripts/pool_manager.py`, `scripts/mcp_server.py`, `scripts/preflight.py`, and `scripts/smoke_test_client.py`. A deployment is not considered ready until steps 6–7 succeed against the live endpoint.
+
+## Timeouts and failures
+
+Distinguish:
+
+- **Submit rejection:** no endpoint task was accepted—inspect UUID, auth, and endpoint configuration.
+- **Scheduler wait:** PBS block is queued—do not blindly resubmit. Scheduler-wait allowance is independent of payload timeout.
+- **Payload failure:** an agent returned a normal result with nonzero `returncode`—use stderr to fix/retry only that payload.
+
+Never alter queue or resource values outside the endpoint user-config schema. Never call scheduler commands from the harness.
+
+## Agent capabilities and filesystem inspection
+
+The Academy agent has exactly two public capabilities:
+
+- `run_code(payload, workdir, timeout)` — execute a Python payload on the agent's pinned accelerator.
+- `inspect_filesystem(operation, path, offset, limit)` — read-only visibility into the worker filesystem without SSH.
+
+`inspect_filesystem` permits only:
+
+| Operation | Semantics | Required bounds |
 |---|---|---|
-| Globus Compute endpoint | the allocation, the modules, the venv, per-agent accelerator pinning | on the HPC, configured out of band -- **not this skill** |
-| academy `HpcAgent` | one action (`run_code`), the TTL self-retirement watchdog | one process per pinned accelerator, launched by the endpoint |
-| `PoolManager` | adopt/revalidate/top-up so the pool survives client restarts and credential expiry | inside the local MCP server process |
-| FastMCP | the wire protocol the harness speaks; exposes exactly one tool | locally, alongside the harness |
+| `ls` | Sorted immediate directory entries with type and size metadata; no recursive traversal. | At most 200 entries. |
+| `cat` | UTF-8 text read, with line numbers. | `offset ≥ 1`, at most 200 lines and 64 KiB. |
+| `tail` | UTF-8 text read from end, with line numbers. | At most 200 lines and 64 KiB. |
 
-## What you deploy
+The action resolves paths and restricts them to the explicit allowed roots: `HPC_BASE_DIR`, `HPC_INSPECT_ROOTS` (colon-separated optional additional roots), and `/tmp`. It rejects symlink escapes, binary data, directories passed to `cat`/`tail`, device files, and every write/mutation operation. Do not add a generic `shell`, `exec`, `find`, `grep`, environment dump, scheduler query, or recursive listing action. For programmatic analysis beyond bounded inspection, write it as a `run_code` payload.
 
-| File | Runs | Purpose |
-|---|---|---|
-| [`scripts/hpc_agent.py`](scripts/hpc_agent.py) | one process per pinned accelerator, launched via Globus Compute | the agent: `run_code`, `probe`, and the TTL watchdog -- nothing else, ever |
-| [`scripts/pool_manager.py`](scripts/pool_manager.py) | imported by `mcp_server.py` | pool lifecycle: adopt live agents, revalidate, top up |
-| [`scripts/mcp_server.py`](scripts/mcp_server.py) | locally, alongside the harness | the only entry point -- opens the Globus exchange, keeps the pool alive, exposes `run_code` as the sole MCP tool |
+## Non-negotiable constraints
 
-Every file is copy-paste ready with inline comments explaining the non-obvious
-parts at the point they matter.
-
-## The flow
-
-1. **Precondition**: a Globus Compute endpoint is already running on the
-   target HPC, configured (accelerator count, queue, walltime, worker
-   environment) out of band via `globus-compute-endpoint configure` /
-   `start`. That configuration is not part of this skill -- get its exchange
-   URL from whoever set it up.
-2. **Agent** (`hpc_agent.py`): `run_code` runs the payload in a subprocess off
-   the event loop, so the agent keeps answering `probe` (and other in-flight
-   calls) while a long snippet runs. Run untrusted/LLM-authored work in a
-   subprocess rather than the agent process itself -- a segfault or `sys.exit`
-   then costs one task, not the whole agent -- and return
-   `{stdout, stderr, returncode}` rather than raising for task-level failure;
-   reserve exceptions for infrastructure faults. `subprocess.run`'s
-   `env=os.environ.copy()` inherits the accelerator-pinning var
-   (`CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`, see
-   [references/site-profiles.md](references/site-profiles.md)) that the
-   endpoint already set on this process before it started.
-3. **Pool** (`pool_manager.py`): every deployment goes through a Globus
-   exchange credential that never refreshes, so the pool needs
-   adopt-before-launch and periodic revalidation even for a short session --
-   see [references/long-running-pools.md](references/long-running-pools.md)
-   for the failure modes this exists to survive, and read it before trusting
-   a real campaign to this pattern.
-4. **Server** (`mcp_server.py`): the only entry point. Set
-   `ACADEMY_EXCHANGE_URL` (the endpoint's exchange) and `HPC_POOL_SIZE`
-   (match the endpoint's accelerator count), then run it locally. It rebinds
-   every launched `Handle` with an explicit `exchange=` before use -- a
-   `Handle` created inside the lifespan and called from a different asyncio
-   task (every FastMCP tool call is one) otherwise dies with
-   `ExchangeClientNotFoundError`, because it resolves its `ExchangeClient`
-   through a ContextVar that doesn't propagate across that task boundary.
-5. **Connect the harness** to the local server over HTTP
-   (`http://127.0.0.1:<HPC_PORT>/mcp` by default). Throughput comes from
-   concurrency *at the harness*: issue many independent `run_code` calls and
-   let the pool's round-robin place them across accelerators.
-
-## Verification ladder -- climb it before trusting a big job
-
-1. **Endpoint reachable**: from the machine that will run `mcp_server.py`,
-   confirm the Globus Compute exchange URL answers and your Globus auth is
-   valid, before writing any campaign code against it.
-2. **Single agent, single call**: run `mcp_server.py` with `HPC_POOL_SIZE=1`,
-   connect an MCP client, `list_tools()` → `run_code`, and a trivial payload
-   (`print("hi")`) → expected stdout. Confirms the launch, the `Handle`
-   rebind, and the round trip.
-3. **Pool of N**: raise `HPC_POOL_SIZE` to match the endpoint's real
-   accelerator count, fire N+ concurrent calls, and confirm they land on
-   distinct workers (have the payload print its pinning env var).
-4. **Restart survival**: kill and restart `mcp_server.py` mid-campaign;
-   confirm the next `run_code` call adopts the still-live agents rather than
-   launching duplicates on top of them (watch the pool size, not just that a
-   call succeeds).
-5. **Credential-expiry dry run**: set `ACADEMY_AGENT_TTL_S` low (minutes) in
-   the endpoint's env for a throwaway test, and confirm an agent retires and
-   the pool tops itself back up without manual intervention, before relying
-   on the real (hours-to-days) TTL for a production campaign.
-
-## Reference material
-
-- [references/site-profiles.md](references/site-profiles.md) -- which env
-  var a payload should read for its pinned accelerator, per site, and how to
-  write device-agnostic payload code.
-- [references/long-running-pools.md](references/long-running-pools.md) -- why
-  the exchange credential never refreshes, the three mechanisms that keep the
-  pool alive despite it, and the diagnostic ladder for telling a wedged pool
-  from a busy one. Read this before any real campaign, not just long ones.
+- `HpcAgent` exposes only `run_code` and bounded, read-only `inspect_filesystem`; an internal health probe is permitted but is never a public MCP tool.
+- One agent is pinned to one addressable accelerator; subprocesses inherit its pinning environment.
+- Preserve endpoint UUID, endpoint config, campaign ID, agent IDs, pins, seeds, commands and outputs.
+- This skill contains no molecular-design logic and exposes no additional MCP capabilities.

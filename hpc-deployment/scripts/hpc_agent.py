@@ -1,125 +1,151 @@
-"""Template: the ONLY agent this pattern ever deploys -- a pure code-execution
-relay. From the hpc-deployment skill.
+"""Pinned Academy agent for hpc-deployment.
 
-This agent exposes exactly one capability: run an arbitrary code payload in a
-subprocess and return what happened. It is not a framework for turning
-arbitrary Python into MCP tools -- if a campaign needs a new capability, that
-capability is a library the payload imports, never a new @action added here.
-Adding domain-specific actions defeats the reason this pattern is safe to
-reuse across campaigns: the LLM harness is solely responsible for generating
-the code that runs; this agent's only job is relaying it to compute the
-harness doesn't otherwise have.
+Public actions are deliberately narrow:
+- run_code: run an LLM-authored Python payload in a subprocess.
+- inspect_filesystem: bounded read-only ls/cat/tail under explicit roots.
 
-Launched via Globus Compute (see scripts/mcp_server.py), never via qsub.
-Getting the underlying allocation -- nodes, accelerators, queue, walltime,
-worker environment -- is the Globus Compute endpoint's job, configured once,
-out of band, on the HPC side. There is no Parsl or PBS/Slurm code in this
-file because it doesn't need any: the endpoint places this process on one
-pinned accelerator and sets that device's env var (CUDA_VISIBLE_DEVICES /
-ZE_AFFINITY_MASK -- see references/site-profiles.md) before this code starts,
-exactly the same pinning contract Parsl workers use. subprocess.run() below
-inherits it for free via env=os.environ.copy().
+Scheduler operations, generic shell execution, environment dumps, and file
+mutation are intentionally absent. The endpoint/Parsl provider owns allocation
+and accelerator pinning before this process starts.
 """
+from __future__ import annotations
+
 import asyncio
 import os
+from pathlib import Path
 
 from academy.agent import Agent, action
 
+_MAX_ENTRIES = 200
+_MAX_LINES = 200
+_MAX_BYTES = 64 * 1024
+
 
 class HpcAgent(Agent):
-    def __init__(self) -> None:
+    def __init__(self, campaign_id: str, base_dir: str, inspect_roots: list[str] | None = None) -> None:
         super().__init__()
         self._inflight = 0
-        self._watchdog: asyncio.Task | None = None
-
-    async def agent_on_startup(self) -> None:
-        self._watchdog = asyncio.create_task(self._lifetime_watchdog())
-
-    async def agent_on_shutdown(self) -> None:
-        if self._watchdog is not None:
-            self._watchdog.cancel()
-
-    async def _lifetime_watchdog(self) -> None:
-        """The Globus exchange credential this agent was launched under never
-        refreshes -- HttpExchangeFactory resolves it once, in __init__, and
-        holds it for the transport's life. Retire before it expires, or this
-        agent detaches silently and keeps holding its worker slot forever.
-        See references/long-running-pools.md. Pick the TTL against the
-        credential's lifetime, not intuition, and read it on the worker (this
-        process's env, not the client's)."""
-        ttl = float(os.environ.get('ACADEMY_AGENT_TTL_S', 30 * 3600))
-        if ttl <= 0:                              # 0 disables, for debugging
-            return
-        await asyncio.sleep(ttl)
-        while self._inflight > 0:                 # don't kill a running task;
-            await asyncio.sleep(30)                # a slow finish beats a lost result
-        self.agent_shutdown()
+        self.campaign_id = campaign_id
+        self.base_dir = str(Path(base_dir).resolve())
+        self.inspect_roots = inspect_roots or []
 
     @action
-    async def probe(self) -> dict[str, float]:
-        """Cheap liveness/load check. The pool manager uses this to prune
-        dead handles, and it's the ground-truth diagnostic for a wedged pool:
-        every other signal (endpoint status, agent count, worker logs) can
-        report healthy while nothing is actually running -- a node reporting
-        load1 == 0.0 while a task is 'running' is wedged, full stop."""
-        return {'pid': float(os.getpid()), 'load1': os.getloadavg()[0]}
+    async def probe(self) -> dict[str, str]:
+        """Internal pool-health check; do not expose as an MCP tool."""
+        return {
+            "pid": str(os.getpid()),
+            "campaign_id": self.campaign_id,
+            "device_pin": os.environ.get("ZE_AFFINITY_MASK", os.environ.get("CUDA_VISIBLE_DEVICES", "")),
+        }
 
     @action
     async def run_code(self, payload: str, workdir: str | None = None,
-                       extra_paths: list[str] | None = None,
                        timeout: float = 300.0) -> dict[str, str]:
-        """Run an LLM-authored Python snippet in a fresh subprocess on this
-        agent's pinned accelerator. Returns {stdout, stderr, returncode}. A
-        nonzero returncode is not raised as an error -- the harness reads
-        stderr, fixes its snippet, and retries. This is the ONLY action this
-        agent exposes; anything else the snippet needs -- another library, a
-        call out to some other tool -- it must do itself, in code."""
         self._inflight += 1
         try:
-            # Off the event loop: subprocess.run() blocks, and the agent must
-            # keep answering `probe` (and other in-flight run_code calls)
-            # while a long snippet runs.
             return await asyncio.get_running_loop().run_in_executor(
-                None, _run_subprocess, payload, workdir, extra_paths, timeout)
+                None, _run_subprocess, payload, workdir or self.base_dir, timeout
+            )
         finally:
             self._inflight -= 1
 
+    @action
+    async def inspect_filesystem(self, operation: str, path: str,
+                                 offset: int = 1, limit: int = 100) -> dict:
+        """Bounded read-only worker filesystem inspection: ls, cat, or tail."""
+        return await asyncio.get_running_loop().run_in_executor(
+            None, _inspect, operation, path, offset, limit, self.base_dir, self.inspect_roots
+        )
 
-def _run_subprocess(payload: str, workdir: str | None,
-                    extra_paths: list[str] | None, timeout: float) -> dict[str, str]:
+
+def _roots(base_dir: str, inspect_roots: list[str]) -> list[Path]:
+    configured = [base_dir, *inspect_roots, "/tmp"]
+    return [Path(item).resolve() for item in configured if item]
+
+
+def _safe_path(raw: str, base_dir: str, inspect_roots: list[str]) -> Path:
+    path = Path(raw).expanduser().resolve(strict=True)
+    if not any(path == root or root in path.parents for root in _roots(base_dir, inspect_roots)):
+        raise ValueError("path is outside allowed inspection roots")
+    if path.is_symlink():  # resolve() normally removes this; retain explicit policy.
+        raise ValueError("symlink paths are not inspectable")
+    if not (path.is_file() or path.is_dir()):
+        raise ValueError("only regular files and directories are inspectable")
+    return path
+
+
+def _clamp(limit: int) -> int:
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    return min(limit, _MAX_LINES)
+
+
+def _read_text_lines(path: Path) -> list[str]:
+    if not path.is_file():
+        raise ValueError("cat/tail require a regular file")
+    if path.stat().st_size > _MAX_BYTES:
+        # Read only bounded bytes so inspection cannot pull an arbitrary log.
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_BYTES)
+    else:
+        data = path.read_bytes()
+    if b"\0" in data:
+        raise ValueError("binary files are not inspectable")
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def _inspect(operation: str, raw_path: str, offset: int, limit: int,
+             base_dir: str, inspect_roots: list[str]) -> dict:
+    path = _safe_path(raw_path, base_dir, inspect_roots)
+    limit = _clamp(limit)
+    if operation == "ls":
+        if not path.is_dir():
+            raise ValueError("ls requires a directory")
+        entries = []
+        for item in sorted(path.iterdir(), key=lambda x: x.name)[:_MAX_ENTRIES]:
+            stat = item.stat(follow_symlinks=False)
+            entries.append({
+                "name": item.name,
+                "type": "directory" if item.is_dir() else "file" if item.is_file() else "other",
+                "size_bytes": stat.st_size,
+            })
+        return {"operation": "ls", "path": str(path), "entries": entries,
+                "truncated": len(list(path.iterdir())) > _MAX_ENTRIES}
+    lines = _read_text_lines(path)
+    if operation == "cat":
+        if offset < 1:
+            raise ValueError("offset must be at least 1")
+        start = offset - 1
+        selected = lines[start:start + limit]
+        first = start + 1
+    elif operation == "tail":
+        selected = lines[-limit:]
+        first = max(1, len(lines) - len(selected) + 1)
+    else:
+        raise ValueError("operation must be one of: ls, cat, tail")
+    return {"operation": operation, "path": str(path), "total_lines": len(lines),
+            "lines": [{"number": first + i, "text": text} for i, text in enumerate(selected)]}
+
+
+def _run_subprocess(payload: str, workdir: str | None, timeout: float) -> dict[str, str]:
     import subprocess
     import sys
     import tempfile
-    from pathlib import Path
 
-    if workdir:
-        Path(workdir).mkdir(parents=True, exist_ok=True)
-
-    env = os.environ.copy()   # carries the endpoint's device-pinning var through
-    parts = [str(p) for p in (extra_paths or [])]
-    if existing := env.get('PYTHONPATH'):
-        parts.append(existing)
-    if parts:
-        env['PYTHONPATH'] = os.pathsep.join(parts)
-
-    # Write a REAL temp file rather than passing `-c`, so tracebacks carry a
-    # stable filename and correct line numbers for the LLM to read and fix.
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(payload)
-        script = f.name
+    cwd = Path(workdir or os.environ.get("HPC_BASE_DIR", ".")).resolve()
+    cwd.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir=cwd) as handle:
+        handle.write(payload)
+        script = Path(handle.name)
     try:
-        proc = subprocess.run([sys.executable, script], capture_output=True,
-                              cwd=workdir, env=env, timeout=timeout)
-        return {'stdout': proc.stdout.decode(errors='replace'),
-                'stderr': proc.stderr.decode(errors='replace'),
-                'returncode': str(proc.returncode)}
+        proc = subprocess.run([sys.executable, str(script)], cwd=cwd, env=os.environ.copy(),
+                              capture_output=True, timeout=timeout)
+        return {"stdout": proc.stdout.decode(errors="replace"),
+                "stderr": proc.stderr.decode(errors="replace"),
+                "returncode": str(proc.returncode)}
     except subprocess.TimeoutExpired as exc:
-        # TimeoutExpired carries whatever was captured before the kill --
-        # return it, so the harness sees how far the snippet got.
-        out = (exc.stdout or b'').decode(errors='replace')
-        err = (exc.stderr or b'').decode(errors='replace')
-        return {'stdout': out,
-                'stderr': f'{err}\nTimed out after {timeout}s and was killed.'.strip(),
-                'returncode': '-1'}
+        return {"stdout": (exc.stdout or b"").decode(errors="replace"),
+                "stderr": ((exc.stderr or b"").decode(errors="replace") + f"\nTimed out after {timeout}s.").strip(),
+                "returncode": "-1"}
     finally:
-        Path(script).unlink(missing_ok=True)
+        script.unlink(missing_ok=True)

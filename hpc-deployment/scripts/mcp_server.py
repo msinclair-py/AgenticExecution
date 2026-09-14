@@ -1,92 +1,103 @@
-"""Template: the ONLY entry point this pattern has.
+"""Local FastMCP server: GCExecutor → PBSPro allocation → pinned Academy agents.
 
-Run this LOCALLY, alongside the harness -- on your laptop, not on the HPC and
-not inside any allocation. It talks to a Globus Compute-backed academy
-exchange to launch and maintain a pool of HpcAgent processes
-(hpc_agent.py) and exposes exactly one MCP tool: run_code. There is no
-head-node launcher and no batch script in this pattern -- getting compute is
-a Globus Compute endpoint call over HTTPS, not an ssh session, and there is
-never a `qsub` anywhere in this flow.
+Required environment:
+  HPC_GLOBUS_ENDPOINT_ID, HPC_POOL_SIZE, HPC_ENDPOINT_CONFIG_JSON,
+  HPC_BASE_DIR, HPC_CAMPAIGN_ID, ACADEMY_EXCHANGE_URL
 
-Precondition: a running Globus Compute endpoint. Its accelerators/node,
-queue, walltime, and worker environment are configured once, out of band, on
-the HPC side (`globus-compute-endpoint configure` / `start`) -- that's out of
-scope for this skill. You need only its exchange URL and enough of an
-accelerator count to size HPC_POOL_SIZE.
+Run locally with the directory containing this file on PYTHONPATH. The endpoint
+must make this directory/module importable on workers, or use an endpoint-
+approved Globus Compute code-shipping serializer.
 """
-import itertools
+from __future__ import annotations
+
+import asyncio
+import json
 import os
+import sys
 from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
 
 from academy.exchange import HttpExchangeFactory
 from academy.handle import Handle
 from academy.manager import Manager
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from globus_compute_sdk import Executor
 
 from hpc_agent import HpcAgent
-from pool_manager import PoolManager
+from pool_manager import CampaignPool
 
-SYSTEM_PROMPT = (
-    'You have a run_code tool that executes a Python snippet on a GPU-pinned '
-    'HPC worker and returns its stdout/stderr/returncode. It is the only '
-    'tool this server exposes -- anything else the work needs (another '
-    'library, a call out to some other program) must happen inside the '
-    'snippet itself.'
-)
 
-EXCHANGE_URL = os.environ['ACADEMY_EXCHANGE_URL']      # Globus Compute-backed academy exchange
-POOL_NAME = os.environ.get('HPC_POOL_NAME', 'default')
-POOL_SIZE = int(os.environ.get('HPC_POOL_SIZE', '4'))  # match the endpoint's accelerator count
-BASE_DIR = os.environ.get('HPC_BASE_DIR', os.getcwd()) # distinguishes this pool from another
-                                                        # campaign's, if they'd otherwise share
-                                                        # an endpoint -- see adopt_live_agents
+def required(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"missing required environment variable: {name}")
+    return value
+
+
+ENDPOINT_ID = required("HPC_GLOBUS_ENDPOINT_ID")
+POOL_SIZE = int(required("HPC_POOL_SIZE"))
+BASE_DIR = required("HPC_BASE_DIR")
+CAMPAIGN_ID = required("HPC_CAMPAIGN_ID")
+EXCHANGE_URL = required("ACADEMY_EXCHANGE_URL")
+ENDPOINT_CONFIG = json.loads(required("HPC_ENDPOINT_CONFIG_JSON"))
+if not isinstance(ENDPOINT_CONFIG, dict):
+    raise RuntimeError("HPC_ENDPOINT_CONFIG_JSON must encode an object")
+if POOL_SIZE < 1:
+    raise RuntimeError("HPC_POOL_SIZE must be positive")
+INSPECT_ROOTS = [item for item in os.environ.get("HPC_INSPECT_ROOTS", "").split(":") if item]
+
+
+# The GC executor is the only allocation launcher. Passing the user endpoint
+# config here causes the endpoint's Parsl PBSProProvider to render the PBS job.
+def make_executor() -> Executor:
+    return Executor(endpoint_id=ENDPOINT_ID, user_endpoint_config=ENDPOINT_CONFIG)
 
 
 def create_server() -> FastMCP:
     @asynccontextmanager
     async def lifespan(server: FastMCP):
-        factory = HttpExchangeFactory(EXCHANGE_URL, auth_method='globus')
-        async with await Manager.from_exchange_factory(
-            factory=factory, executors=ThreadPoolExecutor(),
-        ) as manager:
-            pool = PoolManager(manager, HpcAgent)
-            dispatch = itertools.count()
+        # Values are serialized into every agent constructor; worker-side setup
+        # must make BASE_DIR available. Do not mkdir it locally: it may be a
+        # remote-only HPC filesystem path.
+        factory = HttpExchangeFactory(EXCHANGE_URL, auth_method="globus")
+        gc_executor = make_executor()
+        async with await Manager.from_exchange_factory(factory=factory, executors={"globus": gc_executor}, default_executor="globus") as manager:
+            pool = CampaignPool(manager, HpcAgent, CAMPAIGN_ID, POOL_SIZE)
 
             async def launch_one() -> Handle:
-                handle = await manager.launch(HpcAgent())
-                # REBIND, do not return `handle` directly. A Handle resolves
-                # its ExchangeClient through a ContextVar, and contextvars
-                # propagate parent->child only at task creation. The FastMCP
-                # tool call below runs in a DIFFERENT asyncio task than this
-                # lifespan, so an unrebound handle dies with
-                # ExchangeClientNotFoundError on its first call.
+                # The agent process is submitted through GCExecutor. This is
+                # deliberately not a local executor and has no PBS commands.
+                handle = await manager.launch(
+                    HpcAgent(CAMPAIGN_ID, BASE_DIR, INSPECT_ROOTS),
+                    executor="globus", name=f"{CAMPAIGN_ID}-agent"
+                )
                 return Handle(handle.agent_id, exchange=manager.exchange_client)
 
-            async def run_code(payload: str, workdir: str | None = None,
-                               timeout: float = 300.0) -> dict[str, str]:
-                """Run a Python snippet on a GPU-pinned HPC worker. Returns
-                {stdout, stderr, returncode}. A nonzero returncode means the
-                snippet failed -- read stderr and retry with a fix; it is not
-                a tool error."""
-                handles = await pool.ensure_pool(POOL_NAME, BASE_DIR, POOL_SIZE, launch_one)
-                if not handles:
-                    raise ToolError('no live HPC workers in the pool')
-                handle = handles[next(dispatch) % len(handles)]
+            async def run_code(payload: str, workdir: str | None = None, timeout: float = 300.0) -> dict[str, str]:
+                """Run Python on one campaign-owned, GPU/tile-pinned Academy agent."""
                 try:
-                    return await handle.action('run_code', payload,
-                                               workdir=workdir, timeout=timeout)
+                    agent = await pool.next_agent(launch_one)
+                    return await agent.handle.action("run_code", payload, workdir=workdir or BASE_DIR, timeout=timeout)
                 except Exception as exc:
-                    raise ToolError(str(exc)) from exc
+                    raise ToolError(f"run_code failed: {type(exc).__name__}: {exc}") from exc
+
+            async def inspect_filesystem(operation: str, path: str, offset: int = 1, limit: int = 100) -> dict:
+                """Bounded read-only ls/cat/tail inspection on a pinned campaign worker."""
+                try:
+                    agent = await pool.next_agent(launch_one)
+                    return await agent.handle.action("inspect_filesystem", operation, path, offset=offset, limit=limit)
+                except Exception as exc:
+                    raise ToolError(f"inspect_filesystem failed: {type(exc).__name__}: {exc}") from exc
 
             server.add_tool(run_code)
+            server.add_tool(inspect_filesystem)
             yield
+        gc_executor.shutdown(wait=False, cancel_futures=False)
 
-    return FastMCP(name='hpc-agent', instructions=SYSTEM_PROMPT,
-                   lifespan=lifespan, on_duplicate='replace')
+    return FastMCP(name="hpc-deployment", instructions=(
+        "run_code executes Python on a pinned accelerator. inspect_filesystem is bounded read-only ls/cat/tail; it is not a shell."
+    ), lifespan=lifespan, on_duplicate="replace")
 
 
-if __name__ == '__main__':
-    create_server().run(transport='http', host='127.0.0.1',
-                        port=int(os.environ.get('HPC_PORT', 8000)))
+if __name__ == "__main__":
+    create_server().run(transport=os.environ.get("HPC_MCP_TRANSPORT", "stdio"))
