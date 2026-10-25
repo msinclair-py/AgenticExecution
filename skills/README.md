@@ -100,8 +100,9 @@ folding condition, a different ProteinMPNN weight set, a QM calculation.
 |---|---|---|
 | `polaris-jobs` | ssh + PBS | Submit/monitor A100 jobs on ALCF Polaris over one persistent MFA'd SSH connection; correct mpiexec + `set_affinity_gpu_polaris.sh` GPU binding |
 | `globus-compute-mcp` | globus-compute + academy + fastmcp | FastMCP runs *locally*, dispatching to Globus Compute endpoints — no SSH per call, no tunnel, no inbound port, no MFA prompt |
+| `hpc-deployment` (repo root, not `skills/`) | the same, plus optional `ensemble_launcher` | Campaign-grade deployment of that bridge: `HPC_EXECUTION=direct` gives one agent per pinned GPU/tile, `cluster` hands placement to an Ensemble Launcher master and adds `run_batch` over a JSONL of inputs, a frozen batch registry, a versioned tool library, and a self-healing pool |
 
-Two ways to reach the compute, in increasing decoupling:
+Three ways to reach the compute, in increasing decoupling:
 
 1. **`polaris-jobs`** — *operational*. Open a single multiplexed SSH connection
    (ControlMaster, authenticated once with an MFA token because ALCF requires a
@@ -112,6 +113,14 @@ Two ways to reach the compute, in increasing decoupling:
    dial outbound to the Globus service, so nothing has to be reachable inside the
    facility network, the model stays loaded across calls, and the endpoint
    survives a job hitting walltime.
+3. **`hpc-deployment`** — *federated, campaign-scoped*. The same outbound
+   dispatch with the state a long campaign needs: a campaign ID that isolates
+   agent adoption, a pool that probes and repairs itself, and batches frozen on
+   disk so a crashed run resumes rather than restarting. Its two styles differ in
+   who places work on GPUs — the endpoint (one worker per pin) in `direct` mode,
+   or an Ensemble Launcher master spanning every tile of the allocation in
+   `cluster` mode, which is also what makes `run_batch` possible. Only `cluster`
+   needs `ensemble_launcher` installed on the worker.
 
 ## A typical campaign flow (agent-orchestrated)
 

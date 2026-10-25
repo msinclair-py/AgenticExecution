@@ -10,6 +10,14 @@ MCP tools). The `globus-compute-mcp` skill is the bridge: an MCP server runs
 locally next to the harness and dispatches to Globus Compute endpoints inside the
 facility — no SSH per call, no tunnel, no inbound port, no MFA prompt.
 
+`hpc-deployment` is the campaign-grade form of the same bridge, and it serves two
+execution styles behind one `HPC_EXECUTION` switch: **direct**, one agent per
+pinned GPU/tile running its own payload, and **cluster**, where an
+[Ensemble Launcher](https://github.com/argonne-lcf/ensemble_launcher) master owns
+placement across every tile of a multi-node allocation and `run_batch` fans one
+script over a JSONL of inputs. It adds a frozen batch registry, a versioned tool
+library, and a self-healing agent pool.
+
 On top of that bridge sits a library of **scientific skills** for probing biology
 and biophysics — folding, diffusion-based design, inverse folding, protein
 language models, MD + free energy, QM, cheminformatics, literature RAG — each a
@@ -24,15 +32,24 @@ self-contained procedure the harness reads and runs.
    (local, or in-allocation)     (stateful,          (all GPUs,
         │                         model resident)     all nodes)
         │
-        └── globus-compute-mcp: local server → Globus Compute endpoint → PBS
+        ├── globus-compute-mcp: local server → Globus Compute endpoint → PBS
+        │
+        └── hpc-deployment:     local server → Globus Compute endpoint → PBS
+              ├── direct  mode: one agent per pinned GPU/tile
+              └── cluster mode: HpcClusterAgent → Ensemble Launcher master
+                                → EL places tasks on all tiles, all nodes
 ```
 
 ## Repository layout
 
-Everything lives under `skills/`. Each skill is a directory with a `SKILL.md`
-(frontmatter + procedure) and optional `scripts/` and `references/`.
+Skills live under `skills/`, with `hpc-deployment/` at the repository root. Each
+skill is a directory with a `SKILL.md` (frontmatter + procedure) and optional
+`scripts/` and `references/`.
 
 - `skills/README.md` — the full skill catalog and how they chain into a campaign.
+- `hpc-deployment/` — the campaign-grade execution deployment: the MCP server,
+  the agent and pool implementations, `preflight.py`, and
+  `set_env.example.sh` (copy to `set_env.sh` per campaign).
 - `skills/ENVIRONMENTS.md` — how to pre-provision the heavy GPU environments on a
   cluster (login-node installs, shared weight caches, CUDA/torch matching,
   offline compute nodes). **Read this before running anything GPU-heavy.**
@@ -55,9 +72,10 @@ agent's orchestration job, not the skill's.
 | Skill | Base | Role |
 |---|---|---|
 | `globus-compute-mcp` | globus-compute + academy + fastmcp | **The bridge.** FastMCP runs locally, dispatching to Globus Compute endpoints that dial outbound and acquire PBS allocations on demand |
+| `hpc-deployment` | the same, plus optional `ensemble_launcher` | **The campaign deployment.** One switch picks per-GPU agents (`direct`) or an EL cluster that owns placement and fans a script over a batch (`cluster`); adds a batch registry, a tool library, and pool self-healing |
 | `polaris-jobs` | ssh + PBS | Operational fallback: one persistent MFA'd SSH connection, `qsub`/`qstat`, and the `mpiexec` affinity lines jobs get wrong |
 
-Two ways to reach the compute, in increasing decoupling:
+Three ways to reach the compute, in increasing decoupling:
 
 1. **`polaris-jobs`** — *operational*. One multiplexed SSH connection
    (ControlMaster, authenticated once with an MFA token because ALCF requires a
@@ -67,6 +85,14 @@ Two ways to reach the compute, in increasing decoupling:
    dial outbound, so nothing has to be reachable inside the facility network, the
    model stays loaded across calls, and the endpoint survives a job hitting
    walltime.
+3. **`hpc-deployment`** — *federated, campaign-scoped*. The same outbound
+   dispatch, plus the machinery a long campaign needs: a campaign ID that keeps
+   two runs from adopting each other's agents, a pool that probes and repairs
+   itself, batches frozen on disk so a crashed run resumes instead of restarting,
+   and a registry of reusable tools. Choose `HPC_EXECUTION=direct` for one agent
+   per pinned tile, or `HPC_EXECUTION=cluster` to hand placement to an Ensemble
+   Launcher master and get `run_batch` across the whole allocation. Cluster mode
+   is the only style that needs `ensemble_launcher` on the worker.
 
 ## Scientific skills
 

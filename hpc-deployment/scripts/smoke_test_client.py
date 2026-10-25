@@ -19,9 +19,11 @@ async def main() -> None:
         raise RuntimeError("set HPC_MCP_URL, for example http://127.0.0.1:8000/mcp")
     async with Client(url, timeout=180) as client:
         names = {tool.name for tool in await client.list_tools()}
-        expected = {"run_code", "inspect_filesystem"}
-        if names != expected:
-            raise RuntimeError(f"unexpected tools: {names}; expected {expected}")
+        # run_batch is registered only in cluster mode; the rest always are.
+        expected = {"run_code", "inspect_filesystem", "batch_status", "list_batches",
+                    "register_tool", "list_tools"}
+        if not expected <= names:
+            raise RuntimeError(f"missing tools: {expected - names}; server has {names}")
         probe = """import json, os, socket\nprint(json.dumps({'host': socket.gethostname(), 'campaign': os.environ.get('HPC_CAMPAIGN_ID'), 'pin': os.environ.get('ZE_AFFINITY_MASK', os.environ.get('CUDA_VISIBLE_DEVICES'))}))"""
         code = await client.call_tool("run_code", {"payload": probe})
         print("RUN_CODE", code.content[0].text)
